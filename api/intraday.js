@@ -3,45 +3,65 @@ export default async function handler(req, res) {
     const { symbol, interval } = req.query;
     if (!symbol) return res.status(400).json({ error: "Missing symbol" });
 
-    const allowed = new Set(["1m", "5m", "15m", "30m", "60m"]);
-    const iv = interval || "5m";
-    if (!allowed.has(iv)) return res.status(400).json({ error: "Invalid interval. Use 1m,5m,15m,30m,60m" });
+    // Yahoo supports: 1m,2m,5m,15m,30m,60m,90m,1h,1d...
+    const iv = (interval || "5m").toString();
 
-    const API_KEY = process.env.ALPHA_VANTAGE_KEY;
-    if (!API_KEY) return res.status(500).json({ error: "Missing ALPHA_VANTAGE_KEY on server" });
+    // Pick a reasonable range based on interval
+    const range = ["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"].includes(iv) ? "1d" : "1mo";
 
-    const url = `https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol=${encodeURIComponent(
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
       symbol
-    )}&interval=${encodeURIComponent(iv)}&outputsize=compact&apikey=${encodeURIComponent(API_KEY)}`;
+    )}?interval=${encodeURIComponent(iv)}&range=${encodeURIComponent(range)}&includePrePost=false`;
 
-    const r = await fetch(url);
+    // Set a UA header (Yahoo sometimes blocks requests without one)
+    const r = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; TromGateway/1.0)"
+      }
+    });
+
+    if (!r.ok) {
+      const text = await r.text();
+      return res.status(502).json({ error: "Yahoo request failed", status: r.status, details: text.slice(0, 300) });
+    }
+
     const data = await r.json();
+    const result = data?.chart?.result?.[0];
+    const err = data?.chart?.error;
 
-    if (data?.Note) return res.status(429).json({ error: "Alpha Vantage rate limit", details: data.Note });
-    if (data?.Information) return res.status(502).json({ error: "Alpha Vantage error", details: data.Information });
+    if (err) return res.status(502).json({ error: "Yahoo chart error", details: err });
+    if (!result) return res.status(502).json({ error: "No chart data returned", details: JSON.stringify(data).slice(0, 300) });
 
-    const key = `Time Series (${iv})`;
-    const series = data?.[key];
-    if (!series) return res.status(502).json({ error: "Unexpected response", details: JSON.stringify(data).slice(0, 400) });
+    const ts = result.timestamp || [];
+    const quote = result.indicators?.quote?.[0] || {};
+    const opens = quote.open || [];
+    const highs = quote.high || [];
+    const lows = quote.low || [];
+    const closes = quote.close || [];
+    const volumes = quote.volume || [];
 
-    const candles = Object.entries(series)
-      .slice(0, 200)
-      .map(([t, v]) => ({
-        t: new Date(t + "Z").toISOString(),
-        o: Number(v["1. open"]),
-        h: Number(v["2. high"]),
-        l: Number(v["3. low"]),
-        c: Number(v["4. close"]),
-        v: Number(v["5. volume"])
-      }))
-      .reverse();
+    const candles = [];
+    for (let i = 0; i < ts.length; i++) {
+      const o = opens[i], h = highs[i], l = lows[i], c = closes[i], v = volumes[i];
+      // Skip missing points
+      if ([o, h, l, c].some(x => x === null || x === undefined)) continue;
+      candles.push({
+        t: new Date(ts[i] * 1000).toISOString(),
+        o: Number(o),
+        h: Number(h),
+        l: Number(l),
+        c: Number(c),
+        v: v === null || v === undefined ? null : Number(v)
+      });
+    }
 
     return res.status(200).json({
       symbol: symbol.toUpperCase(),
       interval: iv,
+      range,
       asOf: new Date().toISOString(),
       candles,
-      source: "Alpha Vantage"
+      source: "Yahoo Finance (unofficial)"
     });
   } catch (e) {
     return res.status(500).json({ error: "Server error", details: String(e) });
