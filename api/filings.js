@@ -5,7 +5,7 @@ export default async function handler(req, res) {
 
     // SEC requires a descriptive User-Agent
     const headers = {
-      "User-Agent": "TromMarketGateway your_email@example.com"
+      "User-Agent": "TromMarketGateway yeshi_paljor@yahoo.com"
     };
 
     // First: convert ticker to CIK
