@@ -1,3 +1,14 @@
+// Simple in-memory cache (works well enough for hobby use; may reset between cold starts)
+const CACHE_TTL_MS = 30 * 1000;
+const MIN_UPSTREAM_INTERVAL_MS = 5 * 1000;
+
+const cache = new Map(); // key -> { expiresAt, payload }
+let lastUpstreamFetchAt = 0;
+
+function cacheKey(query, limit) {
+  return `${query}::${limit}`;
+}
+
 export default async function handler(req, res) {
   try {
     const { symbol, q, limit } = req.query;
@@ -5,6 +16,26 @@ export default async function handler(req, res) {
 
     const query = (q && String(q).trim()) || (symbol && String(symbol).trim());
     if (!query) return res.status(400).json({ error: "Provide symbol or q" });
+
+    const key = cacheKey(query, n);
+    const now = Date.now();
+
+    // Serve cached if fresh
+    const hit = cache.get(key);
+    if (hit && now < hit.expiresAt) {
+      return res.status(200).json({ ...hit.payload, cached: true });
+    }
+
+    // Throttle upstream calls to respect GDELT 5s guidance
+    if (now - lastUpstreamFetchAt < MIN_UPSTREAM_INTERVAL_MS) {
+      // If we have any stale cache, serve it rather than failing
+      if (hit) return res.status(200).json({ ...hit.payload, cached: true, stale: true });
+
+      return res.status(429).json({
+        error: "Rate limited (gateway throttle)",
+        details: "Please retry in a few seconds. Provider requires ~1 request per 5 seconds."
+      });
+    }
 
     const url =
       "https://api.gdeltproject.org/api/v2/doc/doc" +
@@ -14,21 +45,25 @@ export default async function handler(req, res) {
       `&maxrecords=${encodeURIComponent(n)}` +
       `&sort=HybridRel`;
 
-    const r = await fetch(url, {
-      headers: { "User-Agent": "TromMarketGateway" }
-    });
+    lastUpstreamFetchAt = now;
 
+    const r = await fetch(url, { headers: { "User-Agent": "TromMarketGateway" } });
     const text = await r.text();
 
-    // If upstream didn’t return JSON, return a helpful JSON error instead of crashing.
+    // If upstream rate-limits us, serve stale cache if possible
+    if (r.status === 429) {
+      if (hit) return res.status(200).json({ ...hit.payload, cached: true, stale: true });
+      return res.status(429).json({ error: "Upstream rate limited", upstream: "GDELT", details: text.slice(0, 200) });
+    }
+
+    // Upstream returned non-JSON
     const firstChar = text.trim().slice(0, 1);
     if (firstChar !== "{" && firstChar !== "[") {
       return res.status(502).json({
         error: "Upstream did not return JSON",
         upstream: "GDELT",
         status: r.status,
-        details: text.trim().slice(0, 300),
-        requestUrl: url
+        details: text.trim().slice(0, 300)
       });
     }
 
@@ -43,12 +78,16 @@ export default async function handler(req, res) {
       snippet: a?.summary || a?.description || null
     }));
 
-    return res.status(200).json({
+    const payload = {
       query,
       asOf: new Date().toISOString(),
       items,
       source: "GDELT (free)"
-    });
+    };
+
+    cache.set(key, { expiresAt: now + CACHE_TTL_MS, payload });
+
+    return res.status(200).json({ ...payload, cached: false });
   } catch (e) {
     return res.status(500).json({ error: "Server error", details: String(e) });
   }
